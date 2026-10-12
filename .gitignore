@@ -1,2 +1,7 @@
 .venv/
 .claude/
+# model outputs (weights are pushed to the Hub, not git)
+gemma3-270m-typed-decisions/
+gemma3-270m-invoice-decider/
+.ipynb_checkpoints/
+__pycache__/

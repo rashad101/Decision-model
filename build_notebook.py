@@ -33,8 +33,9 @@ probabilistic classifier (no text generation or JSON parsing) and keeps the mode
 
 md("## 1. Setup")
 code("""
-# Uncomment on first run if you are not using the provided .venv
-# %pip install -q torch transformers datasets accelerate pandas matplotlib
+# Dependencies are in pyproject.toml / uv.lock: run `uv sync` in the repo and use .venv as the kernel.
+# Without uv, uncomment:
+# %pip install -q -r requirements.txt
 """)
 code("""
 import json, math, random, time, copy
@@ -55,7 +56,7 @@ print("device:", DEVICE, "| torch", torch.__version__)
 
 md("""
 ### Hyperparameters
-`google/gemma-3-270m-it` is gated: accept the license on its Hugging Face page and run `huggingface-cli login` once.
+`google/gemma-3-270m-it` is gated: accept the license on its Hugging Face page and run `uv run hf auth login` once.
 Full fine-tuning in fp32 needs ~5 GB of unified memory (weights + AdamW states), which fits an M3 Pro comfortably.
 """)
 code("""
@@ -517,7 +518,7 @@ This model was fine-tuned on `train`, so it belongs to the **"Fitted or fine-tun
 Format follows the [Hub eval-results docs](https://huggingface.co/docs/hub/en/eval-results): one entry per task id,
 values as fractions (as other entries on this leaderboard do), the dataset revision we scored against, and a
 `source` link to the full test predictions in the model repo.
-Nothing is uploaded until you flip the flags below. Needs a token with write access (`huggingface-cli login`).
+Nothing is uploaded until you flip the flags below. Needs a token with write access (`uv run hf auth login`).
 """)
 code("""
 import os
