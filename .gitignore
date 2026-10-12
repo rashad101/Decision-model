@@ -5,3 +5,5 @@ gemma3-270m-typed-decisions/
 gemma3-270m-invoice-decider/
 .ipynb_checkpoints/
 __pycache__/
+# Optuna trial database (hpo/best_hparams.json is small and worth committing)
+hpo/optuna.db

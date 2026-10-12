@@ -38,7 +38,7 @@ code("""
 # %pip install -q -r requirements.txt
 """)
 code("""
-import json, math, random, time, copy
+import json, math, random, time, copy, os, gc
 import numpy as np
 import pandas as pd
 import torch
@@ -46,18 +46,27 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_cosine_schedule_with_warmup
 from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+import optuna
 
 SEED = 42
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
-DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
-print("device:", DEVICE, "| torch", torch.__version__)
+DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+AMP = DEVICE == "cuda" and torch.cuda.is_bf16_supported()   # bf16 autocast on GPUs that support it (fp32 weights)
+print("device:", DEVICE, "| bf16 autocast:", AMP, "| torch", torch.__version__)
+
+def empty_cache():
+    gc.collect()
+    if DEVICE == "cuda": torch.cuda.empty_cache()
+    elif DEVICE == "mps": torch.mps.empty_cache()
 """)
 
 md("""
 ### Hyperparameters
 `google/gemma-3-270m-it` is gated: accept the license on its Hugging Face page and run `uv run hf auth login` once.
-Full fine-tuning in fp32 needs ~5 GB of unified memory (weights + AdamW states), which fits an M3 Pro comfortably.
+Full fine-tuning in fp32 needs ~5 GB of memory (weights + AdamW states): fine on an M3 Pro or any recent GPU.
+The values below are the defaults; the optional Optuna search in section 5 can replace them (`USE_BEST_HPARAMS`).
 """)
 code("""
 MODEL_ID   = "google/gemma-3-270m-it"
@@ -71,6 +80,17 @@ WEIGHT_DECAY = 0.01
 WARMUP_FRAC  = 0.1
 VAL_FRAC     = 0.1    # held-out part of train (by case) for model selection
 OUT_DIR    = "gemma3-270m-typed-decisions"
+
+# optional hyperparameter search (section 5)
+RUN_HPO          = False  # run the Optuna search (meant for a CUDA GPU)
+HPO_BUDGET_MIN   = 115    # hard wall-clock cap for the whole search, in minutes (2 h minus a safety margin)
+HPO_TRAIN_FRAC   = 0.5    # fraction of the training cases each trial trains on (faster trials, more of them)
+USE_BEST_HPARAMS = True   # final training uses hpo/best_hparams.json if it exists, else the defaults above
+HPO_DIR          = "hpo"
+
+# run tracking (section 6b): every run gets runs/<timestamp>_<model>_<config>[_<tag>]/ with its summary
+RUNS_DIR = "runs"
+RUN_TAG  = ""             # optional short label for this run, e.g. "lr-sweep" or "hpo-best"
 """)
 
 md("## 2. Data")
@@ -165,6 +185,7 @@ tok = AutoTokenizer.from_pretrained(MODEL_ID)
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float32,
                                              attn_implementation="eager").to(DEVICE)
 print(f"{sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
+base_state = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}   # to restart from
 
 # token id for each option letter (as the first token of the model's reply)
 LETTER_IDS = []
@@ -236,7 +257,8 @@ def predict(model, examples, bs=16, desc="predict"):
                   disable=len(examples) <= bs):
         batch = examples[i:i + bs]
         ids, mask, _, opt_mask = collate(batch)
-        lg = option_logits(model, ids.to(DEVICE), mask.to(DEVICE), opt_mask.to(DEVICE))
+        with torch.autocast(DEVICE, dtype=torch.bfloat16, enabled=AMP):
+            lg = option_logits(model, ids.to(DEVICE), mask.to(DEVICE), opt_mask.to(DEVICE))
         P = F.softmax(lg.float(), -1).cpu().numpy()
         for e, p in zip(batch, P):
             preds.append(p[:len(e["labels"])])
@@ -291,48 +313,166 @@ zero_shot
 
 md("## 5. Fine-tuning\n"
    "Plain PyTorch loop: AdamW, cosine schedule with warmup, gradient accumulation, "
-   "and selection of the epoch with the lowest validation KL (calibration is what the benchmark rewards).")
+   "and selection of the epoch with the lowest validation KL (calibration is what the benchmark rewards). "
+   "The loop is a function so the hyperparameter search and the final run share it.")
 code("""
-optim = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-steps_per_epoch = math.ceil(len(train_ex) / BATCH_SIZE / GRAD_ACCUM)
-total_steps = steps_per_epoch * EPOCHS
-sched = get_cosine_schedule_with_warmup(optim, int(WARMUP_FRAC * total_steps), total_steps)
+def train_model(model, train_ex, val_ex, lr, weight_decay, warmup_frac, grad_accum, epochs,
+                trial=None, deadline=None, desc="epochs"):
+    \"\"\"Fine-tune `model` in place. Returns (history, best_state) where best_state is the epoch with the lowest
+    val KL (None during a search). With an Optuna `trial`: reports val KL each epoch for pruning, and stops
+    as soon as time.time() passes `deadline`.\"\"\"
+    optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    total_steps = math.ceil(len(train_ex) / BATCH_SIZE / grad_accum) * epochs
+    sched = get_cosine_schedule_with_warmup(optim, int(warmup_frac * total_steps), total_steps)
+    rng = random.Random(SEED)
+    best_kl, best_state, history = float("inf"), None, []
+    for epoch in tqdm(range(1, epochs + 1), desc=desc, unit="epoch", leave=trial is None):
+        model.train()
+        order = list(range(len(train_ex)))
+        rng.shuffle(order)
+        t0, run_loss, n = time.time(), 0.0, 0
+        bar = tqdm(enumerate(range(0, len(order), BATCH_SIZE)), total=math.ceil(len(order) / BATCH_SIZE),
+                   desc=f"epoch {epoch}/{epochs}", unit="batch", leave=False)
+        for step, i in bar:
+            ids, mask, target, opt_mask = collate([train_ex[j] for j in order[i:i + BATCH_SIZE]])
+            with torch.autocast(DEVICE, dtype=torch.bfloat16, enabled=AMP):
+                lg = option_logits(model, ids.to(DEVICE), mask.to(DEVICE), opt_mask.to(DEVICE))
+            loss = soft_ce(lg, target.to(DEVICE))
+            (loss / grad_accum).backward()
+            run_loss += loss.item(); n += 1
+            if (step + 1) % grad_accum == 0 or i + BATCH_SIZE >= len(order):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optim.step(); sched.step(); optim.zero_grad(set_to_none=True)
+            bar.set_postfix(loss=f"{run_loss / n:.4f}", lr=f"{sched.get_last_lr()[0]:.2e}")
+            if deadline is not None and time.time() > deadline:
+                raise optuna.TrialPruned("time budget reached")
+        val = score(val_ex, predict(model, val_ex, desc=f"val epoch {epoch}")).loc["OVERALL"]
+        history.append(dict(epoch=epoch, train_loss=run_loss / n, val_acc=val.accuracy, val_kl=val.kl,
+                            val_brier=val.brier, minutes=(time.time() - t0) / 60))
+        tqdm.write(f"{desc} " + str({k: round(float(v), 4) for k, v in history[-1].items()}))
+        if val.kl < best_kl:
+            best_kl = val.kl
+            if trial is None:
+                best_state = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+        if trial is not None:
+            trial.report(val.kl, epoch)
+            if trial.should_prune():
+                raise optuna.TrialPruned(f"pruned after epoch {epoch}")
+        empty_cache()
+    return history, best_state
+""")
 
-best_kl, best_state, history = float("inf"), None, []
-for epoch in tqdm(range(1, EPOCHS + 1), desc="epochs", unit="epoch"):
-    model.train()
-    order = list(range(len(train_ex)))
-    random.shuffle(order)
-    t0, run_loss, n = time.time(), 0.0, 0
-    bar = tqdm(enumerate(range(0, len(order), BATCH_SIZE)), total=math.ceil(len(order) / BATCH_SIZE),
-               desc=f"epoch {epoch}/{EPOCHS}", unit="batch", leave=False)
-    for step, i in bar:
-        ids, mask, target, opt_mask = collate([train_ex[j] for j in order[i:i + BATCH_SIZE]])
-        lg = option_logits(model, ids.to(DEVICE), mask.to(DEVICE), opt_mask.to(DEVICE))
-        loss = soft_ce(lg, target.to(DEVICE))
-        (loss / GRAD_ACCUM).backward()
-        run_loss += loss.item(); n += 1
-        if (step + 1) % GRAD_ACCUM == 0 or i + BATCH_SIZE >= len(order):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optim.step(); sched.step(); optim.zero_grad(set_to_none=True)
-        bar.set_postfix(loss=f"{run_loss / n:.4f}", lr=f"{sched.get_last_lr()[0]:.2e}")
-    val = score(val_ex, predict(model, val_ex, desc=f"val epoch {epoch}")).loc["OVERALL"]
-    history.append(dict(epoch=epoch, train_loss=run_loss / n, val_acc=val.accuracy, val_kl=val.kl,
-                        val_brier=val.brier, minutes=(time.time() - t0) / 60))
-    tqdm.write(str({k: round(v, 4) for k, v in history[-1].items()}))
-    if val.kl < best_kl:
-        best_kl = val.kl
-        best_state = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
-    if DEVICE == "mps":
-        torch.mps.empty_cache()
+md("""
+### 5a. Optional: hyperparameter search with Optuna
+Set `RUN_HPO = True` to run it (skipped otherwise). Meant for a CUDA GPU; on Apple Silicon the same budget fits
+only a handful of trials.
 
+* **Objective:** lowest validation KL over a trial's epochs (same criterion as the final run's epoch selection).
+* **Search space:** learning rate, weight decay, warmup fraction, gradient accumulation (effective batch), epochs.
+* **Speed:** each trial trains on `HPO_TRAIN_FRAC` of the training cases (split by case) and is scored on the full
+  validation set; a median pruner stops trials whose val KL after an epoch is worse than the median of earlier trials.
+* **Time cap:** `HPO_BUDGET_MIN` is a hard wall-clock limit for the whole search. Optuna's own `timeout` only stops
+  *starting* new trials, so the training loop also checks the deadline every batch and aborts the running trial.
+* **Resumable:** trials are stored in `hpo/optuna.db`; re-running continues the same study with a fresh budget.
+  The best parameters go to `hpo/best_hparams.json`, which the final training picks up.
+""")
+code("""
+BEST_HP_PATH = f"{HPO_DIR}/best_hparams.json"
+hpo_minutes = None
+
+if RUN_HPO:
+    if DEVICE != "cuda":
+        print(f"warning: running the search on {DEVICE}; expect few trials within {HPO_BUDGET_MIN} min")
+    os.makedirs(HPO_DIR, exist_ok=True)
+    hpo_cases = set(random.Random(SEED).sample(sorted({e["case_id"] for e in train_ex}),
+                                               int(len({e["case_id"] for e in train_ex}) * HPO_TRAIN_FRAC)))
+    hpo_train = [e for e in train_ex if e["case_id"] in hpo_cases]
+    print(f"each trial trains on {len(hpo_cases)} cases ({len(hpo_train)} decisions), validates on {len(val_ex)}")
+
+    deadline = time.time() + HPO_BUDGET_MIN * 60
+
+    def objective(trial):
+        hp = dict(lr=trial.suggest_float("lr", 5e-6, 2e-4, log=True),
+                  weight_decay=trial.suggest_float("weight_decay", 0.0, 0.1),
+                  warmup_frac=trial.suggest_float("warmup_frac", 0.0, 0.2),
+                  grad_accum=trial.suggest_categorical("grad_accum", [1, 2, 4]),
+                  epochs=trial.suggest_int("epochs", 2, 5))
+        model.load_state_dict(base_state)            # every trial starts from the pretrained weights
+        try:
+            history, _ = train_model(model, hpo_train, val_ex, **hp, trial=trial, deadline=deadline,
+                                     desc=f"trial {trial.number}")
+        finally:
+            model.zero_grad(set_to_none=True)
+            empty_cache()
+        best = min(history, key=lambda h: h["val_kl"])
+        trial.set_user_attr("best_epoch", best["epoch"])
+        trial.set_user_attr("val_acc", round(best["val_acc"], 4))
+        return best["val_kl"]
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(study_name=f"gemma3-270m-{CONFIG}", direction="minimize",
+                                storage=f"sqlite:///{HPO_DIR}/optuna.db", load_if_exists=True,
+                                sampler=optuna.samplers.TPESampler(seed=SEED),
+                                pruner=optuna.pruners.MedianPruner(n_startup_trials=4, n_warmup_steps=1))
+    if not any(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials):
+        # start from the defaults so the search can only improve on them
+        study.enqueue_trial(dict(lr=LR, weight_decay=WEIGHT_DECAY, warmup_frac=WARMUP_FRAC,
+                                 grad_accum=GRAD_ACCUM, epochs=min(max(EPOCHS, 2), 5)))
+    t_start = time.time()
+    study.optimize(objective, timeout=HPO_BUDGET_MIN * 60, gc_after_trial=True, show_progress_bar=True,
+                   callbacks=[lambda st, tr: st.stop() if time.time() > deadline else None])
+    model.load_state_dict(base_state)                # leave the model untouched for the final training
+
+    states = pd.Series([t.state.name for t in study.trials]).value_counts().to_dict()
+    hpo_minutes = (time.time() - t_start) / 60
+    print(f"search took {hpo_minutes:.1f} min | trials: {states}")
+    print(f"best val KL {study.best_value:.4f} | {study.best_params} | {study.best_trial.user_attrs}")
+    json.dump({"params": study.best_params, "val_kl": study.best_value, **study.best_trial.user_attrs,
+               "hpo_train_frac": HPO_TRAIN_FRAC, "n_trials": len(study.trials), "device": DEVICE},
+              open(BEST_HP_PATH, "w"), indent=1)
+    print("saved", BEST_HP_PATH)
+    display(study.trials_dataframe(attrs=("number", "value", "params", "user_attrs", "state", "duration"))
+            .sort_values("value").head(10))
+else:
+    print("RUN_HPO is False; skipping the search",
+          f"({BEST_HP_PATH} exists from an earlier run)" if os.path.exists(BEST_HP_PATH) else "")
+""")
+code("""
+if RUN_HPO and len(study.trials) > 1:
+    try:   # which hyperparameters mattered (needs a few completed trials)
+        display(pd.Series(optuna.importance.get_param_importances(study), name="importance").round(3))
+    except Exception as err:
+        print("importance not available:", err)
+    optuna.visualization.matplotlib.plot_optimization_history(study); plt.show()
+""")
+
+md("""
+### 5b. Final training
+Uses the best search result when `USE_BEST_HPARAMS` is on and `hpo/best_hparams.json` exists (from this or an
+earlier run, e.g. a search on a GPU machine), otherwise the defaults from the hyperparameter cell. Training starts from
+the pretrained weights on the full training set.
+""")
+code("""
+HPARAMS = dict(lr=LR, weight_decay=WEIGHT_DECAY, warmup_frac=WARMUP_FRAC, grad_accum=GRAD_ACCUM, epochs=EPOCHS)
+HPARAMS_SOURCE = "defaults"
+if USE_BEST_HPARAMS and os.path.exists(BEST_HP_PATH):
+    HPARAMS.update(json.load(open(BEST_HP_PATH))["params"])
+    HPARAMS_SOURCE = f"Optuna search ({BEST_HP_PATH})"
+LR, WEIGHT_DECAY, WARMUP_FRAC, GRAD_ACCUM, EPOCHS = (HPARAMS[k] for k in
+                                                     ("lr", "weight_decay", "warmup_frac", "grad_accum", "epochs"))
+print("hyperparameters from", HPARAMS_SOURCE, "->", HPARAMS)
+
+model.load_state_dict(base_state)
+t_train = time.time()
+history, best_state = train_model(model, train_ex, val_ex, **HPARAMS)
+train_minutes = (time.time() - t_train) / 60
+empty_cache()
 pd.DataFrame(history).round(4)
 """)
 
 code("""
-import matplotlib.pyplot as plt
 h = pd.DataFrame(history)
-fig, ax = plt.subplots(1, 2, figsize=(10, 3.5))
+curves_fig, ax = plt.subplots(1, 2, figsize=(10, 3.5))
 ax[0].plot(h.epoch, h.train_loss, marker="o", label="train soft-CE")
 ax[0].plot(h.epoch, h.val_kl, marker="o", label="val KL")
 ax[0].set_xlabel("epoch"); ax[0].legend(); ax[0].set_title("Loss")
@@ -383,6 +523,138 @@ for cid in [next(c for c, v in by_case.items() if v[0][0]["workflow"] == w) for 
         fmt = lambda v: ", ".join(f"{l}={x:.2f}" for l, x in zip(e["labels"], v))
         mark = "✓" if e["labels"][int(p.argmax())] == e["gold_label"] else "✗"
         print(f"{mark} {e['task']:<48} pred [{fmt(p)}]\\n  {'':<48} gold [{fmt(e['gold_p'])}]")
+""")
+
+md("""
+### 6b. Save this run's summary
+Everything needed to compare runs later goes to its own folder under `runs/` (small files, meant to be committed):
+
+| file | contents |
+|---|---|
+| `summary.json` | config, hyperparameters (and where they came from), data sizes, training curve, test metrics overall / by type / by workflow / by question, baselines |
+| `summary.md` | the same as a readable report |
+| `train_history.csv`, `training_curves.png` | per-epoch train loss and validation metrics |
+| `test_by_task.csv`, `test_by_type.csv`, `test_by_workflow.csv`, `comparison.csv` | test tables (fine-tuned, zero-shot, Uniform, Prior) |
+| `test_predictions.jsonl` | the full predicted distributions for every test case |
+| `hpo_trials.csv` | the Optuna trials, if the search ran in this session |
+
+`runs/index.csv` is rebuilt from all runs each time. Compare runs in section 10 or with `uv run python compare_runs.py`.
+""")
+code("""
+import subprocess
+from datetime import datetime
+from huggingface_hub import HfApi
+
+def write_predictions(path):
+    \"\"\"Full test distributions, one line per case, so anyone can re-score.\"\"\"
+    with open(path, "w") as f:
+        for cid, items in tqdm(by_case.items(), desc="write predictions", unit="case", leave=False):
+            f.write(json.dumps({"id": cid, "workflow": items[0][0]["workflow"], "answers": {
+                e["qname"]: {"label": e["labels"][int(p.argmax())],
+                             "probabilities": dict(zip(e["labels"], map(float, p)))} for e, p in items}}) + "\\n")
+
+def git_info():
+    try:
+        run = lambda *cmd: subprocess.check_output(["git", *cmd], text=True, stderr=subprocess.DEVNULL).strip()
+        commit, dirty = run("rev-parse", "--short", "HEAD"), bool(run("status", "--porcelain"))
+        return commit, dirty
+    except Exception:
+        return None, None
+
+def tables(df):   # DataFrame from score() -> {row: {metric: value}} without the count column
+    return df.drop(columns="n").astype(float).round(4).to_dict("index")
+
+# The README's reference rows (Uniform 0.169, Prior 0.088) are close to ECE computed per question and averaged
+# over the 20 questions, not pooled over all 2,000 decisions; the leaderboard number uses that, both are kept.
+overall = fine_tuned.loc["OVERALL"].copy()
+overall["ece_pooled"] = overall.ece
+overall["ece"] = fine_tuned.drop("OVERALL").ece.mean()
+by_type, by_wf = score(test_ex, ft_preds, by="qtype"), score(test_ex, ft_preds, by="workflow")
+try:
+    DATASET_SHA = HfApi().dataset_info("LocalLLaMA/typed-decisions").sha
+except Exception:
+    DATASET_SHA = None
+
+created = datetime.now()
+RUN_ID = "_".join(x for x in (created.strftime("%Y%m%d-%H%M%S"), MODEL_ID.split("/")[-1], CONFIG, RUN_TAG) if x)
+RUN_DIR = f"{RUNS_DIR}/{RUN_ID}"
+os.makedirs(RUN_DIR, exist_ok=True)
+commit, dirty = git_info()
+best = min(history, key=lambda r: r["val_kl"])
+
+summary = {
+    "run_id": RUN_ID, "created": created.isoformat(timespec="seconds"), "tag": RUN_TAG,
+    "model_id": MODEL_ID, "config": CONFIG, "dataset_revision": DATASET_SHA,
+    "device": DEVICE, "bf16_autocast": AMP, "torch": torch.__version__, "git_commit": commit, "git_dirty": dirty,
+    "hparams": {**HPARAMS, "batch_size": BATCH_SIZE, "effective_batch": BATCH_SIZE * HPARAMS["grad_accum"],
+                "max_len": MAX_LEN, "val_frac": VAL_FRAC, "seed": SEED},
+    "hparams_source": HPARAMS_SOURCE,
+    "hpo": ({"n_trials": len(study.trials), "minutes": round(hpo_minutes, 1), "best_val_kl": study.best_value,
+             "train_frac": HPO_TRAIN_FRAC} if RUN_HPO and hpo_minutes is not None
+            else json.load(open(BEST_HP_PATH)) if HPARAMS_SOURCE != "defaults" else None),
+    "data": {"train_cases": len({e["case_id"] for e in train_ex}), "val_cases": len({e["case_id"] for e in val_ex}),
+             "test_cases": len(test_raw), "train_decisions": len(train_ex), "val_decisions": len(val_ex),
+             "test_decisions": len(test_ex)},
+    "training": {"epochs_run": len(history), "best_epoch": best["epoch"], "best_val_kl": float(best["val_kl"]),
+                 "best_val_acc": float(best["val_acc"]), "best_val_brier": float(best["val_brier"]),
+                 "minutes": round(train_minutes, 1),
+                 "history": [{k: round(float(v), 4) for k, v in r.items()} for r in history]},
+    "test": {"overall": {k: round(float(overall[k]), 4) for k in ("accuracy", "kl", "brier", "ece", "ece_pooled")},
+             "ece_definition": "10-bin max-probability ECE per question, averaged over questions; "
+                               "ece_pooled = over all decisions",
+             "ms_per_case": round(ms_per_case, 1),
+             "by_type": tables(by_type), "by_workflow": tables(by_wf), "by_task": tables(fine_tuned)},
+    "baselines": {name: {k: round(float(v), 4) for k, v in row.items()} for name, row in comparison.iterrows()
+                  if "fine-tuned" not in name},
+}
+json.dump(summary, open(f"{RUN_DIR}/summary.json", "w"), indent=1)
+
+pd.DataFrame(history).round(4).to_csv(f"{RUN_DIR}/train_history.csv", index=False)
+curves_fig.savefig(f"{RUN_DIR}/training_curves.png", dpi=120, bbox_inches="tight")
+fine_tuned.to_csv(f"{RUN_DIR}/test_by_task.csv")
+by_type.to_csv(f"{RUN_DIR}/test_by_type.csv")
+by_wf.to_csv(f"{RUN_DIR}/test_by_workflow.csv")
+comparison.round(4).to_csv(f"{RUN_DIR}/comparison.csv")
+write_predictions(f"{RUN_DIR}/test_predictions.jsonl")
+if RUN_HPO and hpo_minutes is not None:
+    study.trials_dataframe().to_csv(f"{RUN_DIR}/hpo_trials.csv", index=False)
+
+o = summary["test"]["overall"]
+report = f\"\"\"# Run `{RUN_ID}`
+
+* **Model:** `{MODEL_ID}` on `{CONFIG}` | device `{DEVICE}` | git `{commit or "n/a"}`{" (uncommitted changes)" if dirty else ""}
+* **Hyperparameters** ({HPARAMS_SOURCE}): lr {HPARAMS['lr']:.2e}, weight decay {HPARAMS['weight_decay']:.3f},
+  warmup {HPARAMS['warmup_frac']:.2f}, effective batch {BATCH_SIZE * HPARAMS['grad_accum']}, {HPARAMS['epochs']} epochs
+* **Training:** {train_minutes:.1f} min, best epoch {best['epoch']} (val KL {best['val_kl']:.4f}, val acc {best['val_acc']:.3f})
+* **Test:** accuracy **{o['accuracy']:.3f}**, KL **{o['kl']:.4f}**, Brier {o['brier']:.4f}, ECE {o['ece']:.4f}
+  (pooled {o['ece_pooled']:.4f}), {ms_per_case:.0f} ms / case
+
+## Training curve
+
+{pd.DataFrame(history).round(4).to_markdown(index=False)}
+
+## Test vs baselines
+
+{comparison.round(4).to_markdown()}
+
+## By question type
+
+{by_type.round(4).to_markdown()}
+
+## By workflow
+
+{by_wf.round(4).to_markdown()}
+
+## By question
+
+{fine_tuned.round(4).to_markdown()}
+\"\"\"
+open(f"{RUN_DIR}/summary.md", "w").write(report)
+
+from compare_runs import load_runs
+load_runs(RUNS_DIR).to_csv(f"{RUNS_DIR}/index.csv")
+print("saved run to", RUN_DIR)
+print(sorted(os.listdir(RUN_DIR)))
 """)
 
 md("## 7. Save the model and an inference helper")
@@ -532,13 +804,8 @@ PUSH_TO_HUB     = False   # set True to create/update the model repo with weight
 OPEN_DISCUSSION = False   # set True to post the scores on the benchmark's discussion board
 
 api = HfApi()
-DATASET_SHA = api.dataset_info(BENCHMARK).sha
-overall = fine_tuned.loc["OVERALL"].copy()
-# The README's reference rows (Uniform 0.169, Prior 0.088) are close to ECE computed per question and averaged
-# over the 20 questions, not pooled over all 2,000 decisions; report that one to the leaderboard, keep both.
-overall["ece_pooled"] = overall.ece
-overall["ece"] = fine_tuned.drop("OVERALL").ece.mean()
-by_type, by_wf = score(test_ex, ft_preds, by="qtype"), score(test_ex, ft_preds, by="workflow")
+DATASET_SHA = DATASET_SHA or api.dataset_info(BENCHMARK).sha
+# overall (leaderboard ECE convention), by_type and by_wf come from section 6b
 print(HF_REPO, "| dataset revision", DATASET_SHA[:8])
 overall
 """)
@@ -547,12 +814,7 @@ md("Write the predictions, metrics, `.eval_results/` file and model card into `O
 code("""
 import yaml
 
-# full test distributions, one line per case, so anyone can re-score
-with open(f"{OUT_DIR}/test_predictions.jsonl", "w") as f:
-    for cid, items in tqdm(by_case.items(), desc="write predictions", unit="case"):
-        f.write(json.dumps({"id": cid, "workflow": items[0][0]["workflow"], "answers": {
-            e["qname"]: {"label": e["labels"][int(p.argmax())],
-                         "probabilities": dict(zip(e["labels"], map(float, p)))} for e, p in items}}) + "\\n")
+write_predictions(f"{OUT_DIR}/test_predictions.jsonl")
 
 metrics = {"config": CONFIG, "split": "test", "n_cases": len(test_raw), "n_decisions": len(test_ex),
            "overall": overall.drop("n").to_dict(), "ece_definition": "10-bin max-probability ECE per question, averaged over questions; ece_pooled = over all decisions", "by_type": by_type.drop(columns="n").to_dict("index"),
@@ -690,7 +952,9 @@ DISCUSSION = f\"\"\"**Model:** https://huggingface.co/{HF_REPO}
 
 {RESULTS_MD}
 
-**Setup.** Full fine-tune of `{MODEL_ID}` (fp32, AdamW, lr {LR}, {EPOCHS} epochs, epoch picked on held-out-train KL).
+**Setup.** Full fine-tune of `{MODEL_ID}` (AdamW, lr {LR:.2e}, weight decay {WEIGHT_DECAY:.3f}, warmup {WARMUP_FRAC:.2f},
+effective batch {BATCH_SIZE * GRAD_ACCUM}, {EPOCHS} epochs; hyperparameters from {HPARAMS_SOURCE}; epoch picked on
+held-out-train KL).
 Each question is its own forward pass (5 per case, not all five in one request); the answer distribution is the softmax
 of the next-token logits over the option letters. ECE is 10-bin expected calibration error of max probability vs.
 correctness. Full test distributions are in `test_predictions.jsonl` in the model repo, so the numbers can be re-run.
@@ -701,6 +965,35 @@ if OPEN_DISCUSSION:
     d = api.create_discussion(BENCHMARK, repo_type="dataset",
                               title=f"Submission: {HF_REPO} (Gemma 3 270M, fine-tuned on train)", description=DISCUSSION)
     print("opened:", d.url)
+""")
+
+md("""
+## 10. Compare runs
+Every run saved in section 6b is listed here (newest first), so changes in model, hyperparameters or code can be
+compared side by side. The same tables are available from a terminal: `uv run python compare_runs.py --help`.
+""")
+code("""
+from compare_runs import load_runs, compare_by, pretty
+
+runs = load_runs(RUNS_DIR)
+display(pretty(runs.sort_values("created", ascending=False)))
+""")
+code("""
+# break the test metrics down per question type / workflow / question; one column per run
+display(compare_by("type", "accuracy", RUNS_DIR).round(3))
+display(compare_by("workflow", "kl", RUNS_DIR).round(4))
+""")
+code("""
+# training curves of all runs (validation KL per epoch)
+fig, ax = plt.subplots(1, 2, figsize=(11, 3.5))
+for run_id in runs.index:
+    h = pd.read_csv(f"{RUNS_DIR}/{run_id}/train_history.csv")
+    ax[0].plot(h.epoch, h.val_kl, marker="o", label=run_id)
+    ax[1].plot(h.epoch, h.val_acc, marker="o", label=run_id)
+ax[0].set_title("val KL"); ax[1].set_title("val accuracy")
+for a in ax: a.set_xlabel("epoch"); a.spines[["top", "right"]].set_visible(False)
+ax[1].legend(fontsize=7, loc="center left", bbox_to_anchor=(1, 0.5))
+plt.tight_layout(); plt.show()
 """)
 
 md("""

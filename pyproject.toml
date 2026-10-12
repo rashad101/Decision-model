@@ -19,12 +19,16 @@ dependencies = [
     "huggingface-hub>=2.2",
     "pyyaml>=6.0",
     "requests>=2.34",
+    # run summaries (markdown tables)
+    "tabulate>=0.9",
     # notebook
     "jupyterlab>=4.6",
     "ipykernel>=7.4",
     "ipywidgets>=8.1",
     "nbformat>=5.11",
     "nbconvert>=7.17",
+    # optional hyperparameter search
+    "optuna>=4",
 ]
 
 [tool.uv]
