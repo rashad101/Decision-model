@@ -3,7 +3,10 @@
 # model outputs (weights are pushed to the Hub, not git)
 gemma3-270m-typed-decisions/
 gemma3-270m-invoice-decider/
+ministral3-3b-reasoning-typed-decisions/
+checkpoints/
 .ipynb_checkpoints/
 __pycache__/
 # Optuna trial database (hpo/best_hparams.json is small and worth committing)
 hpo/optuna.db
+hpo/*/optuna.db
